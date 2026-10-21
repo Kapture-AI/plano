@@ -1,0 +1,51 @@
+# Plano, pinned instance (KAN-514, KAN-433). No routing_preferences, so the model a
+# client names is the model that answers. Every service except chat-backend's
+# user-facing answer uses this instance. Same providers as config-routed.yaml.
+version: v0.4.0
+
+listeners:
+  - type: model
+    name: pinned
+    address: 0.0.0.0
+    port: 12000
+    max_retries: 3
+
+model_providers:
+  - model: azure_openai/gpt-4.1-mini
+    access_key: $AZURE_OPENAI_API_KEY
+    base_url: https://fikar-openai.openai.azure.com
+    default: true
+  - model: azure_openai/gpt-4o
+    access_key: $AZURE_OPENAI_API_KEY
+    base_url: https://fikar-openai.openai.azure.com
+  - model: azure_openai/gpt-4o-mini
+    access_key: $AZURE_OPENAI_API_KEY
+    base_url: https://fikar-openai.openai.azure.com
+  - model: azure_openai/gpt-5.6-luna
+    access_key: $AZURE_OPENAI_API_KEY
+    base_url: https://fikar-openai.openai.azure.com
+  - model: azure_openai/gpt-5.6-terra
+    access_key: $AZURE_OPENAI_API_KEY
+    base_url: https://fikar-openai.openai.azure.com
+  - model: azure_openai/gpt-6-astra
+    access_key: $AZURE_OPENAI_API_KEY
+    base_url: https://fikar-openai.openai.azure.com
+  - model: azure_openai/text-embedding-3-small
+    access_key: $AZURE_OPENAI_API_KEY
+    base_url: https://fikar-openai.openai.azure.com
+  - model: foundry/grok-4.6
+    provider_interface: openai
+    access_key: $AZURE_FOUNDRY_API_KEY
+    base_url: https://ranawaqas-0762-resource.openai.azure.com/openai/v1
+  - model: foundry/DeepSeek-V4-Flash-0731
+    provider_interface: openai
+    access_key: $AZURE_FOUNDRY_API_KEY
+    base_url: https://ranawaqas-0762-resource.openai.azure.com/openai/v1
+
+tracing:
+  random_sampling: 100
+  opentracing_grpc_endpoint: http://jaeger:4317
+  attribution_header: x-fikar-org
+  span_attributes:
+    header_prefixes:
+      - x-fikar-
