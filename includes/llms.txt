@@ -1,6 +1,6 @@
 Plano Docs v0.4.37
 llms.txt (auto-generated)
-Generated (UTC): 2026-10-19T08:09:22.400741+00:00
+Generated (UTC): 2026-10-21T09:54:48.644019+00:00
 
 Table of contents
 - Agents (concepts/agents)
@@ -4984,6 +4984,19 @@ hand via Dashboards → New → Import.
 config/grafana/provisioning/ — Grafana provisioning files for the
 datasource and dashboard provider.
 
+Per-organization token attribution
+
+Set tracing.attribution_header to the name of a request header that carries the
+caller’s organization (for example x-fikar-org). brightstaff validates the value
+(at most 64 characters of letters, digits, ., _ and -), adds it as the
+org label on brightstaff_llm_tokens_total and
+brightstaff_llm_tokens_usage_missing_total, sets plano.org on the plano(llm)
+span, and removes the header before the request reaches the provider. A missing or
+empty header counts as org="unattributed"; a malformed one as org="invalid".
+
+tracing:
+  attribution_header: x-fikar-org
+
 ---
 
 Observability
@@ -5685,6 +5698,12 @@ Datadog Exporter
 Langtrace Documentation
 
 Replace placeholders such as <Your-Aws-Region> and <Your-Datadog-Api-Key> with your actual configurations.
+
+Organization attribute
+
+tracing.attribution_header (see the monitoring guide) also stamps the validated
+organization value as plano.org on every plano(llm) span, independent of
+span_attributes.
 
 ---
 
