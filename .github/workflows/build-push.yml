@@ -13,6 +13,7 @@ name: build-push
 on:
   push:
     branches: [main]
+    paths-ignore: ['.github/**', '**.md']
   pull_request:
   workflow_dispatch:
     inputs:
@@ -84,6 +85,25 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
+
+      - name: Tell fikar-infra
+        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        env:
+          GH_TOKEN: ${{ secrets.FIKAR_INFRA_DISPATCH_TOKEN }}
+          SERVICE: ${{ github.event.repository.name }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::notice::FIKAR_INFRA_DISPATCH_TOKEN is not set; the release cron will pick this image up"
+            exit 0
+          fi
+          tag=$(printf '%s\n' "$TAGS" | grep -oE 'sha-[0-9a-f]+' | head -1)
+          [ -n "$tag" ] || { echo "::error::no sha- tag in the metadata output"; exit 1; }
+          gh api -X POST repos/Kapture-AI/fikar-infra/dispatches \
+            -f event_type=image-pushed \
+            -f "client_payload[service]=$SERVICE" \
+            -f "client_payload[tag]=$tag"
+          echo "told fikar-infra: $SERVICE $tag"
 
   check-image:
     if: inputs.image != ''
