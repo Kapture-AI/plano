@@ -28,6 +28,7 @@ use std::net::SocketAddr;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use common::llm_providers::LlmProviders;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use tracing::{info, warn};
@@ -211,6 +212,31 @@ pub fn split_provider_model(full: &str) -> (&str, &str) {
     match full.split_once('/') {
         Some((p, m)) => (p, m),
         None => ("unknown", full),
+    }
+}
+
+/// Provider label for metrics, the usage log and the span, for a resolved model id.
+///
+/// Callers often send a bare model name (`gpt-5.6-terra`), which
+/// [`split_provider_model`] labels `"unknown"` even though the request is served by a
+/// configured provider. In order: the id's own `provider/` prefix; else the prefix of
+/// the matching provider entry's name (so `grok-4.6` served by `foundry/grok-4.6`
+/// stays `foundry`), falling back to the default entry; else that entry's
+/// `provider_interface`; `"unknown"` only when nothing matches.
+pub fn provider_label(providers: &LlmProviders, resolved_model: &str) -> String {
+    let (prefix, _) = split_provider_model(resolved_model);
+    if prefix != "unknown" {
+        return prefix.to_string();
+    }
+    match providers
+        .get(resolved_model)
+        .or_else(|| providers.default())
+    {
+        Some(entry) => match entry.name.split_once('/') {
+            Some((p, _)) if !p.is_empty() => p.to_string(),
+            _ => entry.provider_interface.to_string(),
+        },
+        None => "unknown".to_string(),
     }
 }
 
@@ -513,5 +539,91 @@ pub mod capture {
         ) -> metrics::Histogram {
             metrics::Histogram::noop()
         }
+    }
+}
+
+#[cfg(test)]
+mod provider_label_tests {
+    use super::*;
+    use common::configuration::{LlmProvider, LlmProviderType};
+
+    fn entry(name: &str, interface: LlmProviderType, default: bool) -> LlmProvider {
+        LlmProvider {
+            name: name.to_string(),
+            provider_interface: interface,
+            model: name.split_once('/').map(|(_, m)| m.to_string()),
+            default: Some(default),
+            ..LlmProvider::default()
+        }
+    }
+
+    /// The pinned production config: Azure models with no aliases, Foundry models
+    /// served through the OpenAI interface.
+    fn pinned() -> LlmProviders {
+        LlmProviders::try_from(vec![
+            entry(
+                "azure_openai/gpt-4.1-mini",
+                LlmProviderType::AzureOpenAI,
+                true,
+            ),
+            entry(
+                "azure_openai/gpt-5.6-terra",
+                LlmProviderType::AzureOpenAI,
+                false,
+            ),
+            entry("foundry/grok-4.6", LlmProviderType::OpenAI, false),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn bare_azure_name_gives_azure_openai() {
+        let p = pinned();
+        assert_eq!(provider_label(&p, "gpt-4.1-mini"), "azure_openai");
+        assert_eq!(provider_label(&p, "gpt-5.6-terra"), "azure_openai");
+    }
+
+    #[test]
+    fn bare_foundry_name_gives_foundry_not_interface() {
+        assert_eq!(provider_label(&pinned(), "grok-4.6"), "foundry");
+    }
+
+    #[test]
+    fn prefixed_name_is_unchanged() {
+        let p = pinned();
+        assert_eq!(
+            provider_label(&p, "azure_openai/gpt-4.1-mini"),
+            "azure_openai"
+        );
+        assert_eq!(provider_label(&p, "foundry/grok-4.6"), "foundry");
+        assert_eq!(provider_label(&p, "openai/gpt-4o"), "openai");
+    }
+
+    #[test]
+    fn unknown_model_falls_back_to_default_entry() {
+        assert_eq!(provider_label(&pinned(), "no-such-model"), "azure_openai");
+    }
+
+    #[test]
+    fn unknown_model_without_default_is_unknown() {
+        let p = LlmProviders::try_from(vec![entry(
+            "foundry/grok-4.6",
+            LlmProviderType::OpenAI,
+            false,
+        )])
+        .unwrap();
+        assert_eq!(provider_label(&p, "no-such-model"), "unknown");
+    }
+
+    #[test]
+    fn unprefixed_entry_name_falls_back_to_interface() {
+        let p = LlmProviders::try_from(vec![LlmProvider {
+            name: "my-model".to_string(),
+            provider_interface: LlmProviderType::AzureOpenAI,
+            model: Some("my-model".to_string()),
+            ..LlmProvider::default()
+        }])
+        .unwrap();
+        assert_eq!(provider_label(&p, "my-model"), "azure_openai");
     }
 }
