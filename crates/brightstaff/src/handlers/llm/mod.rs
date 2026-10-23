@@ -482,15 +482,17 @@ async fn llm_chat_inner(
 
     tracing::Span::current().record(tracing_llm::MODEL_NAME, resolved_model.as_str());
 
-    // Record the provider (derived from the `provider/model` prefix) so
-    // observability exporters can populate provider fields (e.g. PostHog
-    // `$ai_provider`).
-    let (resolved_provider, _) = bs_metrics::split_provider_model(&resolved_model);
+    // Record the provider so observability exporters can populate provider fields
+    // (e.g. PostHog `$ai_provider`). The same label goes to the metrics and the usage
+    // log: the `provider/` prefix, or for a bare model name the provider entry that
+    // serves it.
+    let resolved_provider =
+        bs_metrics::provider_label(&*state.llm_providers.read().await, &resolved_model);
     if resolved_provider != "unknown" {
         get_active_span(|span| {
             span.set_attribute(opentelemetry::KeyValue::new(
                 tracing_llm::PROVIDER,
-                resolved_provider.to_string(),
+                resolved_provider.clone(),
             ));
         });
     }
@@ -555,6 +557,7 @@ async fn llm_chat_inner(
         &model_from_request,
         &alias_resolved_model,
         &resolved_model,
+        &resolved_provider,
         &model_name_only,
         &request_path,
         is_streaming_request,
@@ -838,6 +841,7 @@ async fn send_upstream(
     model_from_request: &str,
     alias_resolved_model: &str,
     resolved_model: &str,
+    resolved_provider: &str,
     model_name_only: &str,
     request_path: &str,
     is_streaming_request: bool,
@@ -896,11 +900,11 @@ async fn send_upstream(
 
     let request_start_time = std::time::Instant::now();
 
-    // Labels for LLM upstream metrics. We prefer `resolved_model` (post-routing)
-    // and derive the provider from its `provider/model` prefix. This matches the
-    // same model id the cost/latency router keys off.
-    let (metric_provider_raw, metric_model_raw) = bs_metrics::split_provider_model(resolved_model);
-    let metric_provider = metric_provider_raw.to_string();
+    // Labels for LLM upstream metrics. We prefer `resolved_model` (post-routing), the
+    // same model id the cost/latency router keys off; the provider is the label the
+    // caller resolved against the configured providers (`metrics::provider_label`).
+    let (_, metric_model_raw) = bs_metrics::split_provider_model(resolved_model);
+    let metric_provider = resolved_provider.to_string();
     let metric_model = metric_model_raw.to_string();
 
     let llm_response = match http_client
@@ -1219,5 +1223,89 @@ mod tests {
             );
         assert_eq!(fail_path, "/v1/chat/completions");
         assert_ne!(success_path, fail_path);
+    }
+
+    /// KAN-643: a bare model name on the pinned instance is metered and logged under
+    /// the provider entry that serves it, not "unknown".
+    #[tokio::test]
+    async fn test_send_upstream_logs_resolved_provider_for_bare_model() {
+        use super::{send_upstream, Attribution, ConversationStateContext};
+        use crate::metrics as bs_metrics;
+        use crate::usage_log::UsageLog;
+        use http_body_util::BodyExt;
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"x","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}"#)
+            .create_async()
+            .await;
+
+        let mut azure = build_provider("azure_openai/gpt-5.6-terra", "gpt-5.6-terra");
+        azure.provider_interface = LlmProviderType::AzureOpenAI;
+        let providers = providers_lock(vec![azure, build_provider("foundry/grok-4.6", "grok-4.6")]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = UsageLog::start(dir.path().to_path_buf(), "pinned");
+        let attribution = Attribution {
+            org: "3".into(),
+            service: "chat".into(),
+            user: "42".into(),
+            execution: "kan-643".into(),
+        };
+
+        for model in ["gpt-5.6-terra", "grok-4.6"] {
+            let provider = bs_metrics::provider_label(&*providers.read().await, model);
+            let response = send_upstream(
+                &reqwest::Client::new(),
+                &format!("{}/v1/chat/completions", server.url()),
+                &mut hyper::HeaderMap::new(),
+                bytes::Bytes::from(format!(r#"{{"model":"{model}","messages":[]}}"#)),
+                model,
+                model,
+                model,
+                &provider,
+                model,
+                "/v1/chat/completions",
+                false,
+                None,
+                ConversationStateContext {
+                    should_manage_state: false,
+                    original_input_items: Vec::new(),
+                },
+                None,
+                "req-1".to_string(),
+                &Arc::new(common::configuration::FilterPipeline::default()),
+                None,
+                &attribution,
+                Some(log.clone()),
+            )
+            .await
+            .unwrap();
+            response.into_body().collect().await.unwrap();
+        }
+        log.flush().await;
+        mock.expect(2).assert_async().await;
+
+        let mut got = Vec::new();
+        for f in std::fs::read_dir(dir.path()).unwrap() {
+            for line in std::fs::read_to_string(f.unwrap().path()).unwrap().lines() {
+                let v: serde_json::Value = serde_json::from_str(line).unwrap();
+                got.push((
+                    v["model"].as_str().unwrap().to_string(),
+                    v["provider"].as_str().unwrap().to_string(),
+                ));
+            }
+        }
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("gpt-5.6-terra".to_string(), "azure_openai".to_string()),
+                ("grok-4.6".to_string(), "foundry".to_string()),
+            ]
+        );
     }
 }

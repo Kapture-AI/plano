@@ -233,15 +233,9 @@ pub fn build_upstream_request(
     payload["model"] = Value::String(bare_model.clone());
     let body = Bytes::from(payload.to_string());
 
-    // Provider label: same source as chat (`split_provider_model` on the resolved
-    // model id), falling back to the provider interface when the caller sent a bare
-    // model name. Chat reports "unknown" in that case (see the report on KAN-533).
-    let (prefix_provider, _) = bs_metrics::split_provider_model(&resolved);
-    let provider_label = if prefix_provider == "unknown" {
-        provider.provider_interface.to_string()
-    } else {
-        prefix_provider.to_string()
-    };
+    // Provider label: same helper as chat, so a bare model name is labelled with the
+    // provider entry that serves it rather than "unknown".
+    let provider_label = bs_metrics::provider_label(providers, &resolved);
 
     Ok(UpstreamRequest {
         url,
@@ -536,6 +530,8 @@ mod tests {
         let p = providers(vec![openai_v1()]);
         let up = build(json!({"model":"embed-x","input":"x"}), &p).unwrap();
         assert_eq!(up.url, "https://x.openai.azure.com/openai/v1/embeddings");
+        // Labelled by the provider entry's name, like chat, not by its interface.
+        assert_eq!(up.provider_label, "foundry");
     }
 
     #[test]
