@@ -18,6 +18,8 @@ jobs:
   # Pre-commit (fmt, clippy, cargo test, black, yaml)
   # ──────────────────────────────────────────────
   pre-commit:
+    # Upstream CI; never runs in the Kapture-AI fork (its jobs that need docker-build skip with it).
+    if: github.repository == 'katanemo/plano'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -28,6 +30,8 @@ jobs:
   # Plano tools (CLI) tests — no Docker needed
   # ──────────────────────────────────────────────
   plano-tools-tests:
+    # Upstream CI; never runs in the Kapture-AI fork (its jobs that need docker-build skip with it).
+    if: github.repository == 'katanemo/plano'
     runs-on: ubuntu-latest-m
     defaults:
       run:
@@ -57,6 +61,8 @@ jobs:
   # Native mode smoke test — build from source & start natively
   # ──────────────────────────────────────────────
   native-smoke-test:
+    # Upstream CI; never runs in the Kapture-AI fork (its jobs that need docker-build skip with it).
+    if: github.repository == 'katanemo/plano'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -161,6 +167,8 @@ jobs:
   # Single Docker build — shared by all downstream jobs
   # ──────────────────────────────────────────────
   docker-build:
+    # Upstream CI; never runs in the Kapture-AI fork (its jobs that need docker-build skip with it).
+    if: github.repository == 'katanemo/plano'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -204,6 +212,8 @@ jobs:
   # Validate plano config
   # ──────────────────────────────────────────────
   validate-config:
+    # Upstream CI; never runs in the Kapture-AI fork (its jobs that need docker-build skip with it).
+    if: github.repository == 'katanemo/plano'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code

@@ -8,6 +8,8 @@ permissions:
 
 jobs:
   build:
+    # Upstream docs to GitHub Pages; never runs in the Kapture-AI fork.
+    if: github.repository == 'katanemo/plano'
     runs-on: ubuntu-latest
 
     steps:
