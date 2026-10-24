@@ -42,3 +42,10 @@ run `cargo fmt --all` and `cargo test -p brightstaff` in `crates/`, and open a p
 config check on that pull request is the guard against upstream changing the schema under us.
 
 Upstream's publishing workflows (Docker Hub, PyPI, release binaries) only run in `katanemo/plano`.
+So do upstream's `ci.yml` ("CI") and `static.yml` ("Build and Deploy Documentation"), gated by
+KAN-644 with the same `if: github.repository == 'katanemo/plano'` on their root jobs: CI asked for
+`ubuntu-latest-m` runners the org does not have and failed on upstream's own tests, and the docs job
+pushed upstream's site to the fork's `gh-pages` branch. Their runs on the fork show every job
+skipped. On the fork only `build-push.yml` does work (it skips pushes that change only `.github/`
+or Markdown); `update-providers.yml` runs on dispatch only. Fikar's own gate stays local:
+`cargo test -p brightstaff`.
