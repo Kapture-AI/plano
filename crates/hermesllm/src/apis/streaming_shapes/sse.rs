@@ -48,6 +48,20 @@ pub enum SseStreamBuffer {
     OpenAIResponses(Box<ResponsesAPIStreamBuffer>),
 }
 
+impl SseStreamBuffer {
+    /// End of the upstream stream: the bytes of anything still held for a later event
+    /// (KAN-670). Empty unless a held event was released.
+    pub fn finish(&mut self) -> Vec<u8> {
+        match self {
+            Self::AnthropicMessages(buffer) => {
+                buffer.finish();
+                buffer.to_bytes()
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
 impl SseStreamBufferTrait for SseStreamBuffer {
     fn add_transformed_event(&mut self, event: SseEvent) {
         match self {
