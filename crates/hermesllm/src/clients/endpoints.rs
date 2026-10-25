@@ -187,7 +187,24 @@ impl SupportedAPIsFromClient {
                             build_endpoint("/v1", "/chat/completions")
                         }
                     }
-                    _ => build_endpoint("/v1", "/chat/completions"),
+                    // Translated to chat completions upstream, so route it exactly as a chat
+                    // request (Azure deployment path, Groq/Gemini/Zhipu/Qwen prefixes).
+                    _ => {
+                        let chat_path = if request_path.starts_with("/v1/") {
+                            "/v1/chat/completions"
+                        } else {
+                            request_path
+                        };
+                        SupportedAPIsFromClient::OpenAIChatCompletions(OpenAIApi::ChatCompletions)
+                            .target_endpoint_for_provider(
+                                provider_id,
+                                chat_path,
+                                model_id,
+                                is_streaming,
+                                base_url_path_prefix,
+                                use_unversioned_paths,
+                            )
+                    }
                 }
             }
             SupportedAPIsFromClient::OpenAIResponsesAPI(_) => {
@@ -643,6 +660,107 @@ mod tests {
                 false
             ),
             "/api/v2/messages"
+        );
+    }
+
+    #[test]
+    fn test_anthropic_messages_translated_to_chat_for_openai_shaped_providers() {
+        let api = SupportedAPIsFromClient::AnthropicMessagesAPI(AnthropicApi::Messages);
+        let target = |provider: ProviderId, model: &str, prefix: Option<&str>| {
+            api.target_endpoint_for_provider(&provider, "/v1/messages", model, false, prefix, false)
+        };
+
+        // Azure OpenAI uses the deployment path, as chat does (KAN-660)
+        assert_eq!(
+            target(ProviderId::AzureOpenAI, "gpt-4.1-mini", None),
+            "/openai/deployments/gpt-4.1-mini/chat/completions?api-version=2025-01-01-preview"
+        );
+        assert_eq!(
+            target(
+                ProviderId::AzureOpenAI,
+                "gpt-4.1-mini",
+                Some("/custom/azure/path")
+            ),
+            "/custom/azure/path/gpt-4.1-mini/chat/completions?api-version=2025-01-01-preview"
+        );
+        // Streaming takes the same path
+        assert_eq!(
+            api.target_endpoint_for_provider(
+                &ProviderId::AzureOpenAI,
+                "/v1/messages",
+                "gpt-4.1-mini",
+                true,
+                None,
+                false
+            ),
+            "/openai/deployments/gpt-4.1-mini/chat/completions?api-version=2025-01-01-preview"
+        );
+
+        // OpenAI and other default providers are unchanged
+        assert_eq!(
+            target(ProviderId::OpenAI, "gpt-4", None),
+            "/v1/chat/completions"
+        );
+        assert_eq!(
+            target(ProviderId::Deepseek, "deepseek-chat", None),
+            "/v1/chat/completions"
+        );
+
+        // Providers with their own chat prefix use it
+        assert_eq!(
+            target(ProviderId::Groq, "llama2", None),
+            "/openai/v1/chat/completions"
+        );
+        assert_eq!(
+            target(ProviderId::Gemini, "gemini-pro", None),
+            "/v1beta/openai/chat/completions"
+        );
+        assert_eq!(
+            target(ProviderId::Zhipu, "chatglm", None),
+            "/api/paas/v4/chat/completions"
+        );
+        assert_eq!(
+            target(ProviderId::Qwen, "qwen-turbo", None),
+            "/compatible-mode/v1/chat/completions"
+        );
+
+        // Every translated provider gets the same URL as a chat request
+        let chat = SupportedAPIsFromClient::OpenAIChatCompletions(OpenAIApi::ChatCompletions);
+        for provider in [
+            ProviderId::OpenAI,
+            ProviderId::AzureOpenAI,
+            ProviderId::Groq,
+            ProviderId::Gemini,
+            ProviderId::Zhipu,
+            ProviderId::Qwen,
+            ProviderId::Mistral,
+        ] {
+            assert_eq!(
+                target(provider, "m", None),
+                chat.target_endpoint_for_provider(
+                    &provider,
+                    "/v1/chat/completions",
+                    "m",
+                    false,
+                    None,
+                    false
+                ),
+                "{provider:?}"
+            );
+        }
+
+        // Native Messages providers stay on /messages, Bedrock on converse
+        assert_eq!(
+            target(ProviderId::Anthropic, "claude-3-opus", None),
+            "/v1/messages"
+        );
+        assert_eq!(
+            target(ProviderId::Vercel, "claude-3-opus", None),
+            "/v1/messages"
+        );
+        assert_eq!(
+            target(ProviderId::AmazonBedrock, "us.amazon.nova-pro-v1:0", None),
+            "/model/us.amazon.nova-pro-v1:0/converse"
         );
     }
 
