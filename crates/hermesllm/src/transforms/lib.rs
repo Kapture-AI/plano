@@ -1,6 +1,7 @@
 use crate::apis::anthropic::{MessagesContentBlock, MessagesImageSource};
 use crate::apis::openai::{ContentPart, FunctionCall, ImageUrl, Message, MessageContent, ToolCall};
 use crate::clients::TransformError;
+use log::warn;
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -220,7 +221,8 @@ pub fn convert_openai_message_to_anthropic_content(
     // Handle tool calls
     if let Some(tool_calls) = &message.tool_calls {
         for tool_call in tool_calls {
-            let input: Value = serde_json::from_str(&tool_call.function.arguments)?;
+            let input =
+                parse_tool_arguments(&tool_call.function.name, &tool_call.function.arguments);
             blocks.push(MessagesContentBlock::ToolUse {
                 id: tool_call.id.clone(),
                 name: tool_call.function.name.clone(),
@@ -231,4 +233,242 @@ pub fn convert_openai_message_to_anthropic_content(
     }
 
     Ok(blocks)
+}
+
+/// Parse tool-call arguments, tolerating JSON cut off by max_tokens (KAN-672).
+///
+/// Complete arguments parse as before. Truncated ones (`{"city":"`) are repaired to the
+/// longest valid prefix with the open string and brackets closed (`{"city":""}`), and
+/// anything that still fails becomes `{}`, so one cut tool call cannot fail the response.
+pub fn parse_tool_arguments(tool_name: &str, raw: &str) -> Value {
+    if let Ok(value) = serde_json::from_str(raw) {
+        return value;
+    }
+    match repair_truncated_json(raw) {
+        Some(value) => {
+            warn!(
+                "tool call arguments for {} were truncated ({} bytes); repaired to a partial object",
+                tool_name,
+                raw.len()
+            );
+            value
+        }
+        None => {
+            warn!(
+                "tool call arguments for {} are not valid JSON ({} bytes); using {{}}",
+                tool_name,
+                raw.len()
+            );
+            Value::Object(Default::default())
+        }
+    }
+}
+
+/// Best-effort repair of JSON that was cut off at the end.
+///
+/// Scans once, remembering the last point where the text so far is a complete prefix
+/// (after an opening bracket or a complete value, never after a dangling key, colon or
+/// comma). At the end it tries, in order: closing an open value string, closing the
+/// brackets after a trailing scalar, and closing the brackets at that last good point.
+fn repair_truncated_json(raw: &str) -> Option<Value> {
+    fn closers(stack: &[u8]) -> String {
+        stack
+            .iter()
+            .rev()
+            .map(|&open| if open == b'{' { '}' } else { ']' })
+            .collect()
+    }
+    fn parse(text: String) -> Option<Value> {
+        serde_json::from_str(&text).ok()
+    }
+
+    let bytes = raw.as_bytes();
+    let mut stack: Vec<u8> = Vec::new();
+    // In an object, true until the key's colon: a string here is a key, not a value.
+    let mut expect_key = false;
+    let mut in_string = false;
+    let mut string_is_key = false;
+    // Start of an escape sequence that has not finished yet, and the \u hex digits it still needs.
+    let mut escape_start: Option<usize> = None;
+    let mut hex_left = 0;
+    let mut in_scalar = false;
+    let mut last_good: Option<(usize, Vec<u8>)> = None;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_string {
+            if let Some(start) = escape_start {
+                if hex_left > 0 {
+                    hex_left -= 1;
+                    if hex_left == 0 {
+                        escape_start = None;
+                    }
+                } else if b == b'u' && i == start + 1 {
+                    hex_left = 4;
+                } else {
+                    escape_start = None;
+                }
+            } else if b == b'\\' {
+                escape_start = Some(i);
+            } else if b == b'"' {
+                in_string = false;
+                if !string_is_key {
+                    last_good = Some((i + 1, stack.clone()));
+                }
+            }
+            continue;
+        }
+        if in_scalar && matches!(b, b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r') {
+            in_scalar = false;
+            last_good = Some((i, stack.clone()));
+        }
+        match b {
+            b'"' => {
+                in_string = true;
+                string_is_key = stack.last() == Some(&b'{') && expect_key;
+            }
+            b'{' | b'[' => {
+                stack.push(b);
+                expect_key = b == b'{';
+                last_good = Some((i + 1, stack.clone()));
+            }
+            b'}' | b']' => {
+                stack.pop();
+                expect_key = false;
+                last_good = Some((i + 1, stack.clone()));
+            }
+            b',' => expect_key = stack.last() == Some(&b'{'),
+            b':' => expect_key = false,
+            b' ' | b'\t' | b'\n' | b'\r' => {}
+            _ => in_scalar = true,
+        }
+    }
+
+    if in_string && !string_is_key {
+        let cut = escape_start.unwrap_or(raw.len());
+        if let Some(value) = parse(format!("{}\"{}", &raw[..cut], closers(&stack))) {
+            return Some(value);
+        }
+    } else if in_scalar {
+        if let Some(value) = parse(format!("{}{}", raw, closers(&stack))) {
+            return Some(value);
+        }
+    }
+    let (cut, stack) = last_good?;
+    parse(format!("{}{}", &raw[..cut], closers(&stack)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_parse_tool_arguments_complete_unchanged() {
+        let raw = r#"{"city":"Paris","days":[1,2],"opts":{"metric":true,"note":null}}"#;
+        assert_eq!(
+            parse_tool_arguments("t", raw),
+            serde_json::from_str::<Value>(raw).unwrap()
+        );
+        assert_eq!(parse_tool_arguments("t", "{}"), json!({}));
+    }
+
+    #[test]
+    fn test_parse_tool_arguments_cut_string() {
+        assert_eq!(
+            parse_tool_arguments("t", r#"{"city":""#),
+            json!({"city": ""})
+        );
+        assert_eq!(
+            parse_tool_arguments("t", r#"{"city":"Par"#),
+            json!({"city": "Par"})
+        );
+        assert_eq!(
+            parse_tool_arguments("t", r#"{"city":"a\"#),
+            json!({"city": "a"})
+        );
+        assert_eq!(
+            parse_tool_arguments("t", r#"{"city":"a\u00"#),
+            json!({"city": "a"})
+        );
+        assert_eq!(
+            parse_tool_arguments("t", r#"{"city":"a\nb"#),
+            json!({"city": "a\nb"})
+        );
+    }
+
+    #[test]
+    fn test_parse_tool_arguments_cut_key() {
+        assert_eq!(parse_tool_arguments("t", r#"{""#), json!({}));
+        assert_eq!(parse_tool_arguments("t", r#"{"ci"#), json!({}));
+        assert_eq!(parse_tool_arguments("t", r#"{"city""#), json!({}));
+        assert_eq!(parse_tool_arguments("t", r#"{"city":"#), json!({}));
+        assert_eq!(
+            parse_tool_arguments("t", r#"{"city":"Paris","da"#),
+            json!({"city": "Paris"})
+        );
+        assert_eq!(
+            parse_tool_arguments("t", r#"{"city":"Paris", "days": "#),
+            json!({"city": "Paris"})
+        );
+    }
+
+    #[test]
+    fn test_parse_tool_arguments_dangling_comma() {
+        assert_eq!(
+            parse_tool_arguments("t", r#"{"city":"Paris","#),
+            json!({"city": "Paris"})
+        );
+        assert_eq!(
+            parse_tool_arguments("t", r#"{"days":[1,2,"#),
+            json!({"days": [1, 2]})
+        );
+    }
+
+    #[test]
+    fn test_parse_tool_arguments_cut_scalar() {
+        assert_eq!(
+            parse_tool_arguments("t", r#"{"days":12"#),
+            json!({"days": 12})
+        );
+        assert_eq!(
+            parse_tool_arguments("t", r#"{"ok":true"#),
+            json!({"ok": true})
+        );
+        assert_eq!(
+            parse_tool_arguments("t", r#"{"a":1,"ok":tr"#),
+            json!({"a": 1})
+        );
+        assert_eq!(
+            parse_tool_arguments("t", r#"{"a":1,"n":1."#),
+            json!({"a": 1})
+        );
+    }
+
+    #[test]
+    fn test_parse_tool_arguments_nested() {
+        assert_eq!(
+            parse_tool_arguments("t", r#"{"loc":{"city":"Pa"#),
+            json!({"loc": {"city": "Pa"}})
+        );
+        assert_eq!(
+            parse_tool_arguments("t", r#"{"loc":{"city":"Paris"},"tags":["a","b"#),
+            json!({"loc": {"city": "Paris"}, "tags": ["a", "b"]})
+        );
+        assert_eq!(
+            parse_tool_arguments("t", r#"{"rows":[{"k":[1,{"x":"#),
+            json!({"rows": [{"k": [1, {}]}]})
+        );
+        assert_eq!(
+            parse_tool_arguments("t", r#"{"s":"{[\"x"#),
+            json!({"s": "{[\"x"})
+        );
+    }
+
+    #[test]
+    fn test_parse_tool_arguments_garbage_falls_back_to_empty_object() {
+        assert_eq!(parse_tool_arguments("t", ""), json!({}));
+        assert_eq!(parse_tool_arguments("t", "not json"), json!({}));
+        assert_eq!(parse_tool_arguments("t", "}"), json!({}));
+        assert_eq!(parse_tool_arguments("t", r#"{"a":1}}"#), json!({}));
+    }
 }
