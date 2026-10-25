@@ -78,9 +78,14 @@ impl TryFrom<(&SupportedAPIsFromClient, &SupportedUpstreamAPIs)> for SseStreamBu
             SupportedAPIsFromClient::OpenAIChatCompletions(_) => Ok(
                 SseStreamBuffer::OpenAIChatCompletions(OpenAIChatCompletionsStreamBuffer::new()),
             ),
-            SupportedAPIsFromClient::AnthropicMessagesAPI(_) => Ok(
-                SseStreamBuffer::AnthropicMessages(AnthropicMessagesStreamBuffer::new()),
-            ),
+            SupportedAPIsFromClient::AnthropicMessagesAPI(_) => {
+                Ok(SseStreamBuffer::AnthropicMessages(match upstream_api {
+                    SupportedUpstreamAPIs::OpenAIChatCompletions(_) => {
+                        AnthropicMessagesStreamBuffer::for_openai_upstream()
+                    }
+                    _ => AnthropicMessagesStreamBuffer::new(),
+                }))
+            }
             SupportedAPIsFromClient::OpenAIResponsesAPI(_) => {
                 Ok(SseStreamBuffer::OpenAIResponses(Box::default()))
             }

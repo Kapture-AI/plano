@@ -12,6 +12,19 @@ impl TryFrom<ChatCompletionsStreamResponse> for MessagesStreamEvent {
 
     fn try_from(resp: ChatCompletionsStreamResponse) -> Result<Self, Self::Error> {
         if resp.choices.is_empty() {
+            // KAN-668: with stream_options.include_usage the usage arrives in its own chunk
+            // after the finish chunk, with no choices. Carry it as a MessageDelta; the
+            // AnthropicMessagesStreamBuffer merges it into the held finish delta, whose
+            // stop_reason wins over the placeholder here.
+            if let Some(usage) = resp.usage {
+                return Ok(MessagesStreamEvent::MessageDelta {
+                    delta: MessagesMessageDelta {
+                        stop_reason: MessagesStopReason::EndTurn,
+                        stop_sequence: None,
+                    },
+                    usage: usage.into(),
+                });
+            }
             return Ok(MessagesStreamEvent::Ping);
         }
 
