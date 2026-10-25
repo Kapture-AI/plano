@@ -83,6 +83,9 @@ impl TryFrom<(&SupportedAPIsFromClient, &SupportedUpstreamAPIs)> for SseStreamBu
                     SupportedUpstreamAPIs::OpenAIChatCompletions(_) => {
                         AnthropicMessagesStreamBuffer::for_openai_upstream()
                     }
+                    SupportedUpstreamAPIs::AmazonBedrockConverseStream(_) => {
+                        AnthropicMessagesStreamBuffer::for_bedrock_upstream()
+                    }
                     _ => AnthropicMessagesStreamBuffer::new(),
                 }))
             }

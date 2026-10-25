@@ -47,11 +47,13 @@ pub struct AnthropicMessagesStreamBuffer {
     /// KAN-668: hold a zero-usage `message_delta` until the usage arrives. OpenAI sends
     /// `finish_reason` in one chunk and the usage (stream_options.include_usage) in a
     /// later chunk with no choices; without the hold the client gets a 0/0 delta and
-    /// `to_bytes` closes the message before the usage chunk is read. Set only for an
-    /// OpenAI chat completions upstream, which always ends with `[DONE]`.
+    /// `to_bytes` closes the message before the usage chunk is read. Set for an OpenAI
+    /// chat completions upstream, which ends with `[DONE]`, and for Bedrock ConverseStream,
+    /// whose `metadata` event carries the usage after `messageStop` (KAN-670).
     hold_zero_usage_delta: bool,
 
-    /// The held `message_delta`, released by the next usage delta or by `message_stop`.
+    /// The held `message_delta`, released by the next usage delta, by `message_stop` or
+    /// by `finish`.
     held_message_delta: Option<(MessagesMessageDelta, MessagesUsage)>,
 }
 
@@ -82,6 +84,23 @@ impl AnthropicMessagesStreamBuffer {
         Self {
             hold_zero_usage_delta: true,
             ..Self::new()
+        }
+    }
+
+    /// Buffer for a Bedrock ConverseStream upstream: the `messageStop` delta waits for the
+    /// `metadata` usage, so exactly one `message_delta` carries it (KAN-670).
+    pub fn for_bedrock_upstream() -> Self {
+        Self::for_openai_upstream()
+    }
+
+    /// End of the upstream stream. A held delta whose usage never came goes out with zero
+    /// usage, and the next `to_bytes` closes the message.
+    pub fn finish(&mut self) {
+        if self.message_stopped {
+            return;
+        }
+        if let Some((held_delta, held_usage)) = self.held_message_delta.take() {
+            self.push_message_delta(held_delta, held_usage);
         }
     }
 
@@ -332,24 +351,30 @@ impl SseStreamBufferTrait for AnthropicMessagesStreamBuffer {
                             }
                         }
 
-                        // Check if the last event was also a MessageDelta - if so, merge them
-                        // This handles Bedrock's split of stop_reason (MessageStop) and usage (Metadata)
-                        if let Some(last_event) = self.buffered_events.last_mut() {
-                            if let Some(ProviderStreamResponseType::MessagesStreamEvent(
-                                MessagesStreamEvent::MessageDelta {
-                                    usage: last_usage, ..
-                                },
-                            )) = &mut last_event.provider_stream_response
-                            {
-                                // Merge: take stop_reason from first, usage from second (if non-zero)
-                                if usage.input_tokens > 0 || usage.output_tokens > 0 {
-                                    *last_usage = usage.clone();
-                                }
-                                // Mark that we've seen MessageDelta (need to send MessageStop later)
-                                self.seen_message_delta = true;
-                                // Don't push the new event, we've merged it
-                                return;
-                            }
+                        // Two deltas in a row in the same flush: merge them into one, with the
+                        // first one's stop_reason and the second one's usage if non-zero. The
+                        // merged delta is serialized again so the bytes carry that usage.
+                        if let Some(SseEvent {
+                            provider_stream_response:
+                                Some(ProviderStreamResponseType::MessagesStreamEvent(
+                                    MessagesStreamEvent::MessageDelta {
+                                        delta: last_delta,
+                                        usage: last_usage,
+                                    },
+                                )),
+                            ..
+                        }) = self.buffered_events.last()
+                        {
+                            let has_usage = usage.input_tokens > 0 || usage.output_tokens > 0;
+                            let merged_usage = if has_usage {
+                                usage.clone()
+                            } else {
+                                last_usage.clone()
+                            };
+                            let merged_delta = last_delta.clone();
+                            self.buffered_events.pop();
+                            self.push_message_delta(merged_delta, merged_usage);
+                            return;
                         }
 
                         // No previous MessageDelta to merge with, add this one
@@ -1029,5 +1054,92 @@ data: [DONE]"#;
             out += &feed_openai_chunks(&mut buffer, chunk);
         }
         assert_single_delta_then_stop(&out, 0, 0, "end_turn");
+    }
+
+    // KAN-670: Bedrock ConverseStream sends stop_reason in messageStop and the usage in a
+    // later metadata event, and has no [DONE]. Recorded streams from tests/e2e.
+    fn bedrock_frames(file: &str) -> Vec<SseEvent> {
+        use crate::apis::streaming_shapes::amazon_bedrock_binary_frame::BedrockBinaryFrameDecoder;
+        use aws_smithy_eventstream::frame::DecodedFrame;
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/e2e")
+            .join(file);
+        let data = std::fs::read(&path).unwrap();
+        let mut bytes = bytes::BytesMut::from(&data[..]);
+        let mut decoder = BedrockBinaryFrameDecoder::new(&mut bytes);
+        let (client_api, upstream_api) = bedrock_apis();
+        let mut events = Vec::new();
+        while let Some(frame @ DecodedFrame::Complete(_)) = decoder.decode_frame() {
+            let response =
+                ProviderStreamResponseType::try_from((&frame, &client_api, &upstream_api)).unwrap();
+            events.push(SseEvent::from_provider_response(response));
+        }
+        assert!(!events.is_empty(), "no frames decoded from {file}");
+        events
+    }
+
+    fn bedrock_apis() -> (SupportedAPIsFromClient, SupportedUpstreamAPIs) {
+        (
+            SupportedAPIsFromClient::AnthropicMessagesAPI(AnthropicApi::Messages),
+            SupportedUpstreamAPIs::AmazonBedrockConverseStream(
+                crate::apis::amazon_bedrock::AmazonBedrockApi::ConverseStream,
+            ),
+        )
+    }
+
+    fn bedrock_upstream_buffer() -> SseStreamBuffer {
+        let (client_api, upstream_api) = bedrock_apis();
+        SseStreamBuffer::try_from((&client_api, &upstream_api)).unwrap()
+    }
+
+    /// All frames in one body chunk, one flush.
+    #[test]
+    fn test_bedrock_metadata_usage_in_one_chunk() {
+        let mut buffer = bedrock_upstream_buffer();
+        for event in bedrock_frames("response.hex") {
+            buffer.add_transformed_event(event);
+        }
+        let out = String::from_utf8(buffer.to_bytes()).unwrap();
+        assert_single_delta_then_stop(&out, 19, 500, "max_tokens");
+    }
+
+    /// One frame per body chunk: messageStop and metadata are flushed separately, so
+    /// the finish delta must not go out, or close the message, before metadata.
+    #[test]
+    fn test_bedrock_metadata_usage_across_flushes() {
+        let mut buffer = bedrock_upstream_buffer();
+        let mut out = String::new();
+        for event in bedrock_frames("response.hex") {
+            buffer.add_transformed_event(event);
+            out += &String::from_utf8(buffer.to_bytes()).unwrap();
+        }
+        assert_single_delta_then_stop(&out, 19, 500, "max_tokens");
+    }
+
+    #[test]
+    fn test_bedrock_metadata_usage_keeps_tool_use_stop_reason() {
+        let mut buffer = bedrock_upstream_buffer();
+        let mut out = String::new();
+        for event in bedrock_frames("response_with_tools.hex") {
+            buffer.add_transformed_event(event);
+            out += &String::from_utf8(buffer.to_bytes()).unwrap();
+        }
+        assert_single_delta_then_stop(&out, 742, 539, "tool_use");
+    }
+
+    /// A stream cut after messageStop: end of stream releases the held delta with zero
+    /// usage and closes the message.
+    #[test]
+    fn test_bedrock_stream_without_metadata_closes_at_end_of_stream() {
+        let mut buffer = bedrock_upstream_buffer();
+        let mut out = String::new();
+        let events = bedrock_frames("response.hex");
+        let metadata = events.len() - 1;
+        for event in events.into_iter().take(metadata) {
+            buffer.add_transformed_event(event);
+            out += &String::from_utf8(buffer.to_bytes()).unwrap();
+        }
+        out += &String::from_utf8(buffer.finish()).unwrap();
+        assert_single_delta_then_stop(&out, 0, 0, "max_tokens");
     }
 }

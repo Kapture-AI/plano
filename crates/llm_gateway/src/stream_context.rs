@@ -632,6 +632,14 @@ impl StreamContext {
         }
     }
 
+    /// Bytes still held by the stream buffer at the end of the upstream response.
+    fn finish_stream(&mut self) -> Vec<u8> {
+        match self.sse_buffer.as_mut() {
+            Some(buffer) if self.streaming_response => buffer.finish(),
+            _ => Vec::new(),
+        }
+    }
+
     fn handle_bedrock_binary_stream(
         &mut self,
         body: &[u8],
@@ -1193,6 +1201,11 @@ impl HttpContext for StreamContext {
                 self.request_identifier(),
                 body_size
             );
+            // A stream that ended while the buffer still held an event (KAN-670).
+            let tail = self.finish_stream();
+            if !tail.is_empty() {
+                self.set_http_response_body(0, 0, &tail);
+            }
             self.handle_end_of_request_metrics_and_traces(current_time);
             return Action::Continue;
         }
@@ -1256,7 +1269,10 @@ impl HttpContext for StreamContext {
         let provider_id = self.get_provider_id();
         if self.streaming_response {
             match self.handle_streaming_response(&body, provider_id) {
-                Ok(serialized_body) => {
+                Ok(mut serialized_body) => {
+                    if end_of_stream {
+                        serialized_body.extend(self.finish_stream());
+                    }
                     self.set_http_response_body(0, body_size, &serialized_body);
                 }
                 Err(action) => return action,
