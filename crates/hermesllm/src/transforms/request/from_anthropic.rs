@@ -12,7 +12,7 @@ use crate::apis::anthropic::{
 };
 use crate::apis::openai::{
     ChatCompletionsRequest, ContentPart, FinishReason, Function, FunctionChoice, Message,
-    MessageContent, Role, Tool, ToolCall, ToolChoice, ToolChoiceType, Usage,
+    MessageContent, Role, StreamOptions, Tool, ToolCall, ToolChoice, ToolChoiceType, Usage,
 };
 use crate::clients::TransformError;
 use crate::transforms::lib::*;
@@ -49,6 +49,12 @@ impl TryFrom<AnthropicMessagesRequest> for ChatCompletionsRequest {
             top_p: req.top_p,
             max_completion_tokens: Some(req.max_tokens),
             stream: req.stream,
+            // KAN-668: an Anthropic client always expects usage in message_delta, so a
+            // streamed call must ask the OpenAI-shaped upstream for the final usage chunk.
+            // brightstaff's ensure_stream_usage sees only the MessagesRequest, not this one.
+            stream_options: req.stream.unwrap_or(false).then_some(StreamOptions {
+                include_usage: Some(true),
+            }),
             stop: req.stop_sequences,
             tools: openai_tools,
             tool_choice: openai_tool_choice,
@@ -476,6 +482,53 @@ mod tests {
         MessagesSystemPrompt, MessagesTool, MessagesToolChoice, MessagesToolChoiceType,
     };
     use serde_json::json;
+
+    fn messages_request(stream: Option<bool>) -> MessagesRequest {
+        MessagesRequest {
+            model: "gpt-4.1-mini".to_string(),
+            messages: vec![MessagesMessage {
+                role: MessagesRole::User,
+                content: MessagesMessageContent::Single("Reply with: ok".to_string()),
+            }],
+            max_tokens: 16,
+            container: None,
+            mcp_servers: None,
+            system: None,
+            metadata: None,
+            service_tier: None,
+            thinking: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stream,
+            stop_sequences: None,
+            tools: None,
+            tool_choice: None,
+        }
+    }
+
+    // KAN-668: the converted streaming request asks the OpenAI-shaped upstream for usage.
+    #[test]
+    fn test_anthropic_to_openai_streaming_requests_usage() {
+        let chat: ChatCompletionsRequest = messages_request(Some(true)).try_into().unwrap();
+        assert_eq!(chat.stream, Some(true));
+        assert_eq!(
+            chat.stream_options.as_ref().and_then(|o| o.include_usage),
+            Some(true)
+        );
+        let body = serde_json::to_value(&chat).unwrap();
+        assert_eq!(body["stream_options"], json!({"include_usage": true}));
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_non_streaming_has_no_stream_options() {
+        for stream in [None, Some(false)] {
+            let chat: ChatCompletionsRequest = messages_request(stream).try_into().unwrap();
+            assert!(chat.stream_options.is_none(), "stream={stream:?}");
+            let body = serde_json::to_value(&chat).unwrap();
+            assert!(body.get("stream_options").is_none(), "stream={stream:?}");
+        }
+    }
 
     #[test]
     fn test_anthropic_to_bedrock_basic_request() {

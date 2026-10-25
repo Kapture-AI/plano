@@ -43,6 +43,16 @@ pub struct AnthropicMessagesStreamBuffer {
 
     /// Model name to use when generating message_start events
     model: Option<String>,
+
+    /// KAN-668: hold a zero-usage `message_delta` until the usage arrives. OpenAI sends
+    /// `finish_reason` in one chunk and the usage (stream_options.include_usage) in a
+    /// later chunk with no choices; without the hold the client gets a 0/0 delta and
+    /// `to_bytes` closes the message before the usage chunk is read. Set only for an
+    /// OpenAI chat completions upstream, which always ends with `[DONE]`.
+    hold_zero_usage_delta: bool,
+
+    /// The held `message_delta`, released by the next usage delta or by `message_stop`.
+    held_message_delta: Option<(MessagesMessageDelta, MessagesUsage)>,
 }
 
 impl Default for AnthropicMessagesStreamBuffer {
@@ -61,6 +71,17 @@ impl AnthropicMessagesStreamBuffer {
             needs_content_block_stop: false,
             seen_message_delta: false,
             model: None,
+            hold_zero_usage_delta: false,
+            held_message_delta: None,
+        }
+    }
+
+    /// Buffer for an OpenAI chat completions upstream: the finish delta waits for the
+    /// usage chunk so exactly one `message_delta` carries the real usage (KAN-668).
+    pub fn for_openai_upstream() -> Self {
+        Self {
+            hold_zero_usage_delta: true,
+            ..Self::new()
         }
     }
 
@@ -82,18 +103,23 @@ impl AnthropicMessagesStreamBuffer {
     /// Used when we must close a message but upstream never produced a terminal
     /// event (e.g. `[DONE]` arrives with no prior `finish_reason`).
     fn push_synthetic_message_delta(&mut self) {
-        let event = MessagesStreamEvent::MessageDelta {
-            delta: MessagesMessageDelta {
+        self.push_message_delta(
+            MessagesMessageDelta {
                 stop_reason: MessagesStopReason::EndTurn,
                 stop_sequence: None,
             },
-            usage: MessagesUsage {
+            MessagesUsage {
                 input_tokens: 0,
                 output_tokens: 0,
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: None,
             },
-        };
+        );
+    }
+
+    /// Push a freshly serialized `message_delta`, so the wire bytes match its usage.
+    fn push_message_delta(&mut self, delta: MessagesMessageDelta, usage: MessagesUsage) {
+        let event = MessagesStreamEvent::MessageDelta { delta, usage };
         let sse_string: String = event.clone().into();
         self.buffered_events.push(SseEvent {
             data: None,
@@ -277,7 +303,7 @@ impl SseStreamBufferTrait for AnthropicMessagesStreamBuffer {
                         // Content deltas are between ContentBlockStart and ContentBlockStop
                         self.buffered_events.push(event);
                     }
-                    MessagesStreamEvent::MessageDelta { usage, .. } => {
+                    MessagesStreamEvent::MessageDelta { delta, usage } => {
                         // `message_delta` is only meaningful inside an open message.
                         // Upstream can send it with no prior content (empty completion,
                         // content filter, etc.), so we must open a message first.
@@ -289,6 +315,21 @@ impl SseStreamBufferTrait for AnthropicMessagesStreamBuffer {
                                 AnthropicMessagesStreamBuffer::create_content_block_stop_event();
                             self.buffered_events.push(content_block_stop);
                             self.needs_content_block_stop = false;
+                        }
+
+                        if self.hold_zero_usage_delta {
+                            let has_usage = usage.input_tokens > 0 || usage.output_tokens > 0;
+                            if let Some((held_delta, held_usage)) = self.held_message_delta.take() {
+                                // The usage chunk after the finish chunk: one delta with the
+                                // finish chunk's stop_reason and the real usage.
+                                let usage = if has_usage { usage.clone() } else { held_usage };
+                                self.push_message_delta(held_delta, usage);
+                                return;
+                            }
+                            if !has_usage && !self.seen_message_delta {
+                                self.held_message_delta = Some((delta.clone(), usage.clone()));
+                                return;
+                            }
                         }
 
                         // Check if the last event was also a MessageDelta - if so, merge them
@@ -336,6 +377,12 @@ impl SseStreamBufferTrait for AnthropicMessagesStreamBuffer {
                                 AnthropicMessagesStreamBuffer::create_content_block_stop_event();
                             self.buffered_events.push(content_block_stop);
                             self.needs_content_block_stop = false;
+                        }
+
+                        // A held finish delta whose usage chunk never came: send it with
+                        // zero usage (KAN-668 fallback).
+                        if let Some((held_delta, held_usage)) = self.held_message_delta.take() {
+                            self.push_message_delta(held_delta, held_usage);
                         }
 
                         // If no message_delta has been emitted yet (empty/filtered upstream
@@ -411,7 +458,7 @@ mod tests {
     use super::*;
     use crate::apis::anthropic::AnthropicApi;
     use crate::apis::openai::OpenAIApi;
-    use crate::apis::streaming_shapes::sse::SseStreamIter;
+    use crate::apis::streaming_shapes::sse::{SseStreamBuffer, SseStreamIter};
     use crate::clients::{SupportedAPIsFromClient, SupportedUpstreamAPIs};
 
     #[test]
@@ -866,5 +913,121 @@ data: [DONE]"#;
             tail.is_empty(),
             "No bytes should be emitted after message_stop, got: {tail:?}"
         );
+    }
+
+    // KAN-668: OpenAI sends finish_reason, then usage in a chunk with no choices, then [DONE].
+    fn feed_openai_chunks(buffer: &mut SseStreamBuffer, chunk: &str) -> String {
+        let client_api = SupportedAPIsFromClient::AnthropicMessagesAPI(AnthropicApi::Messages);
+        let upstream_api = SupportedUpstreamAPIs::OpenAIChatCompletions(OpenAIApi::ChatCompletions);
+        for raw in SseStreamIter::try_from(chunk.as_bytes()).unwrap() {
+            let e = SseEvent::try_from((raw, &client_api, &upstream_api)).unwrap();
+            buffer.add_transformed_event(e);
+        }
+        String::from_utf8(buffer.to_bytes()).unwrap()
+    }
+
+    fn openai_upstream_buffer() -> SseStreamBuffer {
+        let client_api = SupportedAPIsFromClient::AnthropicMessagesAPI(AnthropicApi::Messages);
+        let upstream_api = SupportedUpstreamAPIs::OpenAIChatCompletions(OpenAIApi::ChatCompletions);
+        SseStreamBuffer::try_from((&client_api, &upstream_api)).unwrap()
+    }
+
+    /// The `data` payloads of every `message_delta` in the output, in order.
+    fn message_deltas(out: &str) -> Vec<serde_json::Value> {
+        let mut deltas = Vec::new();
+        let mut lines = out.lines();
+        while let Some(line) = lines.next() {
+            if line == "event: message_delta" {
+                let data = lines.next().unwrap().strip_prefix("data: ").unwrap();
+                deltas.push(serde_json::from_str(data).unwrap());
+            }
+        }
+        deltas
+    }
+
+    const TEXT_CHUNK: &str = r#"data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}"#;
+    const FINISH_CHUNK: &str = r#"data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
+    const USAGE_CHUNK: &str = r#"data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1-mini","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":1,"total_tokens":12}}"#;
+
+    fn assert_single_delta_then_stop(out: &str, input: u64, output: u64, stop_reason: &str) {
+        let deltas = message_deltas(out);
+        assert_eq!(deltas.len(), 1, "exactly one message_delta. Output:\n{out}");
+        assert_eq!(deltas[0]["usage"]["input_tokens"], input, "Output:\n{out}");
+        assert_eq!(
+            deltas[0]["usage"]["output_tokens"], output,
+            "Output:\n{out}"
+        );
+        assert_eq!(
+            deltas[0]["delta"]["stop_reason"], stop_reason,
+            "Output:\n{out}"
+        );
+        assert_eq!(
+            out.matches("event: message_stop").count(),
+            1,
+            "Output:\n{out}"
+        );
+        let p_delta = out.find("event: message_delta").unwrap();
+        let p_stop = out.find("event: message_stop").unwrap();
+        assert!(
+            p_delta < p_stop,
+            "message_delta before message_stop. Output:\n{out}"
+        );
+        assert!(
+            out.trim_end().ends_with(r#"data: {"type":"message_stop"}"#),
+            "Output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn test_openai_usage_chunk_becomes_the_single_message_delta() {
+        let mut buffer = openai_upstream_buffer();
+        let out = feed_openai_chunks(
+            &mut buffer,
+            &format!("{TEXT_CHUNK}\n\n{FINISH_CHUNK}\n\n{USAGE_CHUNK}\n\ndata: [DONE]"),
+        );
+        assert_single_delta_then_stop(&out, 11, 1, "end_turn");
+    }
+
+    /// The live shape: each upstream chunk is its own HTTP body chunk, with a flush
+    /// between them. The finish delta must not go out (or close the message) before
+    /// the usage chunk is read.
+    #[test]
+    fn test_openai_usage_chunk_across_flushes() {
+        let mut buffer = openai_upstream_buffer();
+        let mut out = String::new();
+        for chunk in [TEXT_CHUNK, FINISH_CHUNK] {
+            out += &feed_openai_chunks(&mut buffer, chunk);
+        }
+        assert!(!out.contains("event: message_delta"), "Output:\n{out}");
+        assert!(!out.contains("event: message_stop"), "Output:\n{out}");
+        for chunk in [USAGE_CHUNK, "data: [DONE]"] {
+            out += &feed_openai_chunks(&mut buffer, chunk);
+        }
+        assert_single_delta_then_stop(&out, 11, 1, "end_turn");
+    }
+
+    #[test]
+    fn test_openai_usage_chunk_keeps_tool_use_stop_reason() {
+        let tool_start = r#"data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}"#;
+        let tool_args = r#"data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"Paris\"}"}}]},"finish_reason":null}]}"#;
+        let finish = r#"data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1-mini","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#;
+        let usage = r#"data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1-mini","choices":[],"usage":{"prompt_tokens":40,"completion_tokens":9,"total_tokens":49}}"#;
+        let mut buffer = openai_upstream_buffer();
+        let mut out = String::new();
+        for chunk in [tool_start, tool_args, finish, usage, "data: [DONE]"] {
+            out += &feed_openai_chunks(&mut buffer, chunk);
+        }
+        assert_single_delta_then_stop(&out, 40, 9, "tool_use");
+    }
+
+    /// An upstream that ignores include_usage: the zero-usage fallback still closes the message.
+    #[test]
+    fn test_openai_stream_without_usage_chunk_ends_with_zero_usage_delta() {
+        let mut buffer = openai_upstream_buffer();
+        let mut out = String::new();
+        for chunk in [TEXT_CHUNK, FINISH_CHUNK, "data: [DONE]"] {
+            out += &feed_openai_chunks(&mut buffer, chunk);
+        }
+        assert_single_delta_then_stop(&out, 0, 0, "end_turn");
     }
 }

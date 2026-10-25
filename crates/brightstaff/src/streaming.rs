@@ -864,6 +864,28 @@ data: [DONE]
         assert_eq!(u.total_tokens, Some(10));
     }
 
+    // KAN-668: a streamed /v1/messages call to an OpenAI-shaped provider reaches the meter
+    // as Anthropic SSE; the usage is in message_delta, after message_start's zeros.
+    #[test]
+    fn streaming_anthropic_message_delta_usage_is_metered() {
+        let sse = b"event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"gpt-4.1-mini\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}
+
+event: message_delta
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":11,\"output_tokens\":1}}
+
+event: message_stop
+data: {\"type\":\"message_stop\"}
+
+";
+        let u = extract_usage_from_bytes(sse);
+        assert_eq!(u.prompt_tokens, Some(11));
+        assert_eq!(u.completion_tokens, Some(1));
+    }
+
     #[test]
     fn empty_returns_default() {
         assert!(extract_usage_from_bytes(b"").is_empty());
