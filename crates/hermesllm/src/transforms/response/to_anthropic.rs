@@ -814,4 +814,26 @@ mod tests {
         );
         assert_eq!(resp.stop_reason, MessagesStopReason::MaxTokens);
     }
+
+    // KAN-672: max_tokens cut the forced tool's arguments mid-string; the conversion must not fail.
+    #[test]
+    fn test_openai_tool_call_truncated_arguments_with_length() {
+        let resp = openai_response(
+            json!({"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\":\""}
+            }]}),
+            "length",
+        );
+        match &resp.content[0] {
+            MessagesContentBlock::ToolUse { name, input, .. } => {
+                assert_eq!(name, "get_weather");
+                assert_eq!(input, &json!({"city": ""}));
+            }
+            other => panic!("expected tool_use, got {:?}", other),
+        }
+        assert_eq!(resp.stop_reason, MessagesStopReason::MaxTokens);
+        assert_eq!(resp.usage.input_tokens, 60);
+        assert_eq!(resp.usage.output_tokens, 5);
+    }
 }
