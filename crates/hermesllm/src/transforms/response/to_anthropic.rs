@@ -21,10 +21,18 @@ impl TryFrom<ChatCompletionsResponse> for MessagesResponse {
             .ok_or_else(|| TransformError::MissingField("choices".to_string()))?;
 
         let content = convert_openai_message_to_anthropic_content(&choice.message.to_message())?;
-        let stop_reason = choice
+        let mut stop_reason = choice
             .finish_reason
             .map(|fr| fr.into())
             .unwrap_or(MessagesStopReason::EndTurn);
+        // KAN-671: OpenAI finishes a forced named tool_choice with "stop", not "tool_calls".
+        if stop_reason == MessagesStopReason::EndTurn
+            && content
+                .iter()
+                .any(|block| matches!(block, MessagesContentBlock::ToolUse { .. }))
+        {
+            stop_reason = MessagesStopReason::ToolUse;
+        }
 
         let usage = MessagesUsage {
             input_tokens: resp.usage.prompt_tokens,
@@ -757,5 +765,53 @@ mod tests {
 
         // Should use fallback model name
         assert_eq!(anthropic_response_fallback.model, "bedrock-model");
+    }
+
+    // KAN-671: OpenAI answers a forced named function with finish_reason "stop".
+    fn openai_response(message: serde_json::Value, finish_reason: &str) -> MessagesResponse {
+        let resp: crate::apis::openai::ChatCompletionsResponse = serde_json::from_value(json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "gpt-4.1-mini",
+            "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+            "usage": {"prompt_tokens": 60, "completion_tokens": 5, "total_tokens": 65}
+        }))
+        .unwrap();
+        resp.try_into().unwrap()
+    }
+
+    #[test]
+    fn test_openai_forced_tool_with_stop_maps_to_tool_use() {
+        let resp = openai_response(
+            json!({"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
+            }]}),
+            "stop",
+        );
+        assert!(matches!(
+            resp.content[0],
+            MessagesContentBlock::ToolUse { .. }
+        ));
+        assert_eq!(resp.stop_reason, MessagesStopReason::ToolUse);
+    }
+
+    #[test]
+    fn test_openai_text_with_stop_stays_end_turn() {
+        let resp = openai_response(json!({"role": "assistant", "content": "Sunny."}), "stop");
+        assert_eq!(resp.stop_reason, MessagesStopReason::EndTurn);
+    }
+
+    #[test]
+    fn test_openai_tool_call_with_length_stays_max_tokens() {
+        let resp = openai_response(
+            json!({"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "get_weather", "arguments": "{}"}
+            }]}),
+            "length",
+        );
+        assert_eq!(resp.stop_reason, MessagesStopReason::MaxTokens);
     }
 }

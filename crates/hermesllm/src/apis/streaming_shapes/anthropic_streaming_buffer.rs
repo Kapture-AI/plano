@@ -55,6 +55,10 @@ pub struct AnthropicMessagesStreamBuffer {
     /// The held `message_delta`, released by the next usage delta, by `message_stop` or
     /// by `finish`.
     held_message_delta: Option<(MessagesMessageDelta, MessagesUsage)>,
+
+    /// KAN-671: a `tool_use` content block has gone out. OpenAI finishes a forced named
+    /// tool_choice with `stop`, so an `end_turn` delta after a tool call says `tool_use`.
+    saw_tool_use: bool,
 }
 
 impl Default for AnthropicMessagesStreamBuffer {
@@ -75,6 +79,7 @@ impl AnthropicMessagesStreamBuffer {
             model: None,
             hold_zero_usage_delta: false,
             held_message_delta: None,
+            saw_tool_use: false,
         }
     }
 
@@ -122,9 +127,14 @@ impl AnthropicMessagesStreamBuffer {
     /// Used when we must close a message but upstream never produced a terminal
     /// event (e.g. `[DONE]` arrives with no prior `finish_reason`).
     fn push_synthetic_message_delta(&mut self) {
+        let stop_reason = if self.saw_tool_use {
+            MessagesStopReason::ToolUse
+        } else {
+            MessagesStopReason::EndTurn
+        };
         self.push_message_delta(
             MessagesMessageDelta {
-                stop_reason: MessagesStopReason::EndTurn,
+                stop_reason,
                 stop_sequence: None,
             },
             MessagesUsage {
@@ -296,9 +306,18 @@ impl SseStreamBufferTrait for AnthropicMessagesStreamBuffer {
                         self.buffered_events.push(event);
                         self.message_started = true;
                     }
-                    MessagesStreamEvent::ContentBlockStart { index, .. } => {
+                    MessagesStreamEvent::ContentBlockStart {
+                        index,
+                        content_block,
+                    } => {
                         let index = *index as i32;
                         self.ensure_message_started();
+                        if matches!(
+                            content_block,
+                            crate::apis::anthropic::MessagesContentBlock::ToolUse { .. }
+                        ) {
+                            self.saw_tool_use = true;
+                        }
 
                         // Add the content_block_start event (from tool calls or other sources)
                         self.buffered_events.push(event);
@@ -327,6 +346,19 @@ impl SseStreamBufferTrait for AnthropicMessagesStreamBuffer {
                         // Upstream can send it with no prior content (empty completion,
                         // content filter, etc.), so we must open a message first.
                         self.ensure_message_started();
+
+                        // KAN-671: end_turn after a tool_use block is a forced tool call.
+                        let tool_use_rewrite =
+                            self.saw_tool_use && delta.stop_reason == MessagesStopReason::EndTurn;
+                        let delta = if tool_use_rewrite {
+                            MessagesMessageDelta {
+                                stop_reason: MessagesStopReason::ToolUse,
+                                stop_sequence: delta.stop_sequence.clone(),
+                            }
+                        } else {
+                            delta.clone()
+                        };
+                        let usage = usage.clone();
 
                         // Inject ContentBlockStop before message_delta
                         if self.needs_content_block_stop {
@@ -377,7 +409,12 @@ impl SseStreamBufferTrait for AnthropicMessagesStreamBuffer {
                             return;
                         }
 
-                        // No previous MessageDelta to merge with, add this one
+                        // No previous MessageDelta to merge with, add this one. A rewritten
+                        // delta is serialized again so the bytes carry tool_use.
+                        if tool_use_rewrite {
+                            self.push_message_delta(delta, usage);
+                            return;
+                        }
                         self.buffered_events.push(event);
                         self.seen_message_delta = true;
                     }
@@ -1054,6 +1091,82 @@ data: [DONE]"#;
             out += &feed_openai_chunks(&mut buffer, chunk);
         }
         assert_single_delta_then_stop(&out, 0, 0, "end_turn");
+    }
+
+    // KAN-671: a forced named tool_choice makes OpenAI finish with "stop", not "tool_calls".
+    const TOOL_START_CHUNK: &str = r#"data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}"#;
+    const TOOL_ARGS_CHUNK: &str = r#"data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"Paris\"}"}}]},"finish_reason":null}]}"#;
+    const TOOL_USAGE_CHUNK: &str = r#"data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1-mini","choices":[],"usage":{"prompt_tokens":60,"completion_tokens":5,"total_tokens":65}}"#;
+
+    #[test]
+    fn test_openai_forced_tool_stop_becomes_tool_use() {
+        let mut buffer = openai_upstream_buffer();
+        let out = feed_openai_chunks(
+            &mut buffer,
+            &format!("{TOOL_START_CHUNK}\n\n{TOOL_ARGS_CHUNK}\n\n{FINISH_CHUNK}\n\n{TOOL_USAGE_CHUNK}\n\ndata: [DONE]"),
+        );
+        assert_single_delta_then_stop(&out, 60, 5, "tool_use");
+    }
+
+    /// The live shape: every upstream chunk in its own flush, the finish chunk and the
+    /// usage chunk included.
+    #[test]
+    fn test_openai_forced_tool_stop_becomes_tool_use_across_flushes() {
+        let mut buffer = openai_upstream_buffer();
+        let mut out = String::new();
+        for chunk in [
+            TOOL_START_CHUNK,
+            TOOL_ARGS_CHUNK,
+            FINISH_CHUNK,
+            TOOL_USAGE_CHUNK,
+            "data: [DONE]",
+        ] {
+            out += &feed_openai_chunks(&mut buffer, chunk);
+        }
+        assert_single_delta_then_stop(&out, 60, 5, "tool_use");
+    }
+
+    /// An upstream that ignores include_usage: the zero-usage fallback delta says tool_use too.
+    #[test]
+    fn test_openai_forced_tool_stop_without_usage_chunk() {
+        let mut buffer = openai_upstream_buffer();
+        let mut out = String::new();
+        for chunk in [
+            TOOL_START_CHUNK,
+            TOOL_ARGS_CHUNK,
+            FINISH_CHUNK,
+            "data: [DONE]",
+        ] {
+            out += &feed_openai_chunks(&mut buffer, chunk);
+        }
+        assert_single_delta_then_stop(&out, 0, 0, "tool_use");
+    }
+
+    /// Finish and usage in one chunk (an upstream that sends both together).
+    #[test]
+    fn test_openai_forced_tool_stop_with_usage_in_finish_chunk() {
+        let finish_with_usage = r#"data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":60,"completion_tokens":5,"total_tokens":65}}"#;
+        let mut buffer = openai_upstream_buffer();
+        let mut out = String::new();
+        for chunk in [
+            TOOL_START_CHUNK,
+            TOOL_ARGS_CHUNK,
+            finish_with_usage,
+            "data: [DONE]",
+        ] {
+            out += &feed_openai_chunks(&mut buffer, chunk);
+        }
+        assert_single_delta_then_stop(&out, 60, 5, "tool_use");
+    }
+
+    #[test]
+    fn test_openai_text_stop_stays_end_turn_across_flushes() {
+        let mut buffer = openai_upstream_buffer();
+        let mut out = String::new();
+        for chunk in [TEXT_CHUNK, FINISH_CHUNK, USAGE_CHUNK, "data: [DONE]"] {
+            out += &feed_openai_chunks(&mut buffer, chunk);
+        }
+        assert_single_delta_then_stop(&out, 11, 1, "end_turn");
     }
 
     // KAN-670: Bedrock ConverseStream sends stop_reason in messageStop and the usage in a
