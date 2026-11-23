@@ -42,7 +42,12 @@ pub struct EmbeddingsError {
 }
 
 impl EmbeddingsError {
-    fn new(status: StatusCode, message: String, param: Option<&str>, code: Option<&str>) -> Self {
+    pub(crate) fn new(
+        status: StatusCode,
+        message: String,
+        param: Option<&str>,
+        code: Option<&str>,
+    ) -> Self {
         Self {
             status,
             body: json!({
@@ -56,7 +61,7 @@ impl EmbeddingsError {
         }
     }
 
-    fn into_response(self) -> Response<BoxBody<Bytes, hyper::Error>> {
+    pub(crate) fn into_response(self) -> Response<BoxBody<Bytes, hyper::Error>> {
         json_response(self.status, self.body.to_string())
     }
 }
@@ -73,7 +78,7 @@ pub struct UpstreamRequest {
     pub model_label: String,
 }
 
-fn json_response(
+pub(crate) fn json_response(
     status: StatusCode,
     body: impl Into<Bytes>,
 ) -> Response<BoxBody<Bytes, hyper::Error>> {
@@ -93,13 +98,23 @@ fn json_response(
 /// so the scheme is inferred from the port the CLI defaulted: 443 (or unset) is
 /// https, anything else is http.
 pub fn upstream_url(provider: &LlmProvider, bare_model: &str) -> Result<String, String> {
+    upstream_url_for(provider, bare_model, "embeddings")
+}
+
+/// Same as [`upstream_url`] for any OpenAI operation path (`embeddings`,
+/// `audio/transcriptions`), shared with the transcriptions passthrough.
+pub(crate) fn upstream_url_for(
+    provider: &LlmProvider,
+    bare_model: &str,
+    operation: &str,
+) -> Result<String, String> {
     let host = match (provider.endpoint.as_deref(), &provider.provider_interface) {
         (Some(h), _) if !h.is_empty() => h,
         (_, LlmProviderType::OpenAI) => DEFAULT_OPENAI_HOST,
         _ => {
             return Err(format!(
-                "Provider '{}' has no endpoint configured for embeddings",
-                provider.name
+                "Provider '{}' has no endpoint configured for {}",
+                provider.name, operation
             ))
         }
     };
@@ -116,13 +131,14 @@ pub fn upstream_url(provider: &LlmProvider, bare_model: &str) -> Result<String, 
 
     let path = if provider.provider_interface == LlmProviderType::AzureOpenAI {
         format!(
-            "/{}/{}/embeddings?api-version={}",
+            "/{}/{}/{}?api-version={}",
             prefix.unwrap_or(AZURE_DEPLOYMENTS_PREFIX),
             bare_model,
+            operation,
             AZURE_API_VERSION
         )
     } else {
-        format!("/{}/embeddings", prefix.unwrap_or("v1"))
+        format!("/{}/{}", prefix.unwrap_or("v1"), operation)
     };
     Ok(format!("{scheme}://{authority}{path}"))
 }
@@ -130,7 +146,7 @@ pub fn upstream_url(provider: &LlmProvider, bare_model: &str) -> Result<String, 
 /// Headers sent to the provider: content-type, the provider's own credential, and the
 /// provider's configured extra headers. Nothing from the client's request is copied,
 /// so neither the attribution header nor the client's `Authorization` can leak.
-fn upstream_headers(provider: &LlmProvider) -> Result<HeaderMap, EmbeddingsError> {
+pub(crate) fn upstream_headers(provider: &LlmProvider) -> Result<HeaderMap, EmbeddingsError> {
     let Some(key) = provider.access_key.as_deref().filter(|k| !k.is_empty()) else {
         return Err(EmbeddingsError::new(
             StatusCode::INTERNAL_SERVER_ERROR,

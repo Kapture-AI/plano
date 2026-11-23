@@ -11,6 +11,7 @@ use brightstaff::handlers::function_calling::function_calling_chat_handler;
 use brightstaff::handlers::llm::llm_chat;
 use brightstaff::handlers::models::list_models;
 use brightstaff::handlers::routing_service::routing_decision;
+use brightstaff::handlers::transcriptions::transcriptions;
 use brightstaff::metrics as bs_metrics;
 use brightstaff::metrics::labels as metric_labels;
 use brightstaff::router::model_metrics::ModelMetricsService;
@@ -539,6 +540,7 @@ fn handler_label_for(method: &Method, path: &str) -> &'static str {
             metric_labels::HANDLER_LLM_CHAT
         }
         (&Method::POST, "/v1/embeddings") => metric_labels::HANDLER_EMBEDDINGS,
+        (&Method::POST, "/v1/audio/transcriptions") => metric_labels::HANDLER_TRANSCRIPTIONS,
         (&Method::POST, "/function_calling") => metric_labels::HANDLER_FUNCTION_CALLING,
         (&Method::GET, "/v1/models" | "/agents/v1/models") => metric_labels::HANDLER_LIST_MODELS,
         (&Method::OPTIONS, "/v1/models" | "/agents/v1/models") => {
@@ -621,6 +623,11 @@ async fn dispatch(
         }
         (&Method::POST, "/v1/embeddings") => {
             embeddings(req, Arc::clone(&state))
+                .with_context(parent_cx)
+                .await
+        }
+        (&Method::POST, "/v1/audio/transcriptions") => {
+            transcriptions(req, Arc::clone(&state))
                 .with_context(parent_cx)
                 .await
         }
@@ -718,6 +725,18 @@ mod tests {
         // Only POST is routed; anything else stays a 404.
         assert_eq!(
             handler_label_for(&Method::GET, "/v1/embeddings"),
+            metric_labels::HANDLER_NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn transcriptions_path_has_its_own_handler_label() {
+        assert_eq!(
+            handler_label_for(&Method::POST, "/v1/audio/transcriptions"),
+            "transcriptions"
+        );
+        assert_eq!(
+            handler_label_for(&Method::GET, "/v1/audio/transcriptions"),
             metric_labels::HANDLER_NOT_FOUND
         );
     }
