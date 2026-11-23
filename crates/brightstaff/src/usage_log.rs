@@ -26,6 +26,7 @@ const CHANNEL_CAPACITY: usize = 8192;
 
 pub const ENDPOINT_CHAT: &str = "chat";
 pub const ENDPOINT_EMBEDDINGS: &str = "embeddings";
+pub const ENDPOINT_TRANSCRIPTIONS: &str = "transcriptions";
 
 /// Token counts of one metered response, as recorded on the counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

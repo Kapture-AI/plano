@@ -7,6 +7,7 @@ pub mod models;
 pub mod response;
 pub mod routing_budget_request;
 pub mod routing_service;
+pub mod transcriptions;
 
 #[cfg(test)]
 mod integration_tests;
